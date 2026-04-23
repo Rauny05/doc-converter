@@ -192,9 +192,9 @@ function findGs() {
 async function libreOffice(inputPath, targetFmt, outDir, infilter = null) {
   const soffice = findSoffice();
   if (!soffice) {
-    throw new Error(
-      'LibreOffice is not installed. Install it: brew install --cask libreoffice'
-    );
+    const err = new Error('LibreOffice is not available in this environment. Document conversion requires a self-hosted instance.');
+    err.code = 'NO_LIBREOFFICE';
+    throw err;
   }
   const args = ['--headless', '--norestore'];
   if (infilter) args.push(`--infilter=${infilter}`);

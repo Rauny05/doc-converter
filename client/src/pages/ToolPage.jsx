@@ -249,11 +249,21 @@ export default function ToolPage({ tool }) {
 
             {/* Error */}
             {status === 'error' && (
-              <div className="err-banner">
-                <AlertCircle size={15} />
-                <span>{errMsg}</span>
-                <button className="err-retry" onClick={process}>Retry</button>
-              </div>
+              errMsg.includes('LibreOffice') ? (
+                <div className="err-libreoffice">
+                  <div className="err-lo-icon">⚙️</div>
+                  <div>
+                    <p className="err-lo-title">Not available in cloud mode</p>
+                    <p className="err-lo-body">Document conversion requires LibreOffice, which can't run on serverless hosting. Run the app locally to use this feature.</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="err-banner">
+                  <AlertCircle size={15} />
+                  <span>{errMsg}</span>
+                  <button className="err-retry" onClick={process}>Retry</button>
+                </div>
+              )
             )}
 
             {/* Action */}

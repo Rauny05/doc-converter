@@ -603,6 +603,20 @@ input, select, textarea { font-family: inherit; }
   .header-inner { padding: 0 16px; }
 }
 
+.err-libreoffice {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  border-radius: var(--r);
+  padding: 18px 20px;
+  margin-top: 12px;
+}
+.err-lo-icon { font-size: 24px; flex-shrink: 0; }
+.err-lo-title { font-weight: 600; color: #92400E; font-size: 15px; margin-bottom: 4px; }
+.err-lo-body  { color: #78350F; font-size: 13px; line-height: 1.5; }
+
 /* ── PDF Editor ─────────────────────────────────────────────────────────── */
 
 .editor-shell {
