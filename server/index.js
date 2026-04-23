@@ -15,9 +15,14 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const allowedOrigin = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 app.use(helmet());
-app.use(cors({ origin: allowedOrigin }));
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || process.env.VERCEL) return cb(null, true);
+    const allowed = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim());
+    cb(allowed.includes(origin) ? null : new Error('Not allowed by CORS'), allowed.includes(origin));
+  },
+}));
 app.use(express.json());
 
 const tmpDirs = new Set();
@@ -138,6 +143,49 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter(req, file, cb) { cb(null, true); },
 });
+
+// Multi-file multer for merge
+const storageMulti = multer.diskStorage({
+  destination(req, file, cb) {
+    if (!req._uploadDir) req._uploadDir = mkTmpDir('merge');
+    cb(null, req._uploadDir);
+  },
+  filename(req, file, cb) {
+    req._fileIdx = (req._fileIdx || 0) + 1;
+    const ext = path.extname(file.originalname);
+    cb(null, `file-${String(req._fileIdx).padStart(3, '0')}${ext}`);
+  },
+});
+const uploadMulti = multer({ storage: storageMulti, limits: { fileSize: 100 * 1024 * 1024 } });
+
+// Page range parser for split
+function parsePageRanges(input, total) {
+  const set = new Set();
+  for (const part of input.split(',').map(s => s.trim()).filter(Boolean)) {
+    if (part.includes('-')) {
+      const [a, b] = part.split('-').map(Number);
+      for (let i = Math.max(1, a); i <= Math.min(b, total); i++) set.add(i - 1);
+    } else {
+      const n = Number(part);
+      if (n >= 1 && n <= total) set.add(n - 1);
+    }
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+// Ghostscript detection for compress
+const GS_CANDIDATES = ['gs', '/opt/homebrew/bin/gs', '/usr/bin/gs', '/usr/local/bin/gs'];
+let _gsPath = null;
+function findGs() {
+  if (_gsPath !== null) return _gsPath;
+  for (const p of GS_CANDIDATES) {
+    try {
+      require('child_process').execSync(`"${p}" --version`, { stdio: 'ignore', timeout: 3000 });
+      _gsPath = p; return p;
+    } catch {}
+  }
+  _gsPath = ''; return '';
+}
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
@@ -278,7 +326,336 @@ function csvToXlsx(inputPath, outPath) {
   XLSX.writeFile(wb, outPath);
 }
 
-// ── Route ────────────────────────────────────────────────────────────────────
+// ── Merge ────────────────────────────────────────────────────────────────────
+
+app.post('/api/merge', uploadMulti.array('files', 20), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  const files = req.files;
+  if (!files || files.length < 2)
+    return res.status(400).json({ error: 'Upload at least 2 PDF files' });
+
+  const t0 = Date.now();
+  try {
+    const { PDFDocument } = require('pdf-lib');
+    const merged = await PDFDocument.create();
+    for (const f of files) {
+      const bytes = await fsPromises.readFile(f.path);
+      const doc   = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const pages = await merged.copyPages(doc, doc.getPageIndices());
+      pages.forEach(p => merged.addPage(p));
+    }
+    const buf     = Buffer.from(await merged.save());
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    log(`MERGE ${files.length} files → ${buf.length} bytes in ${elapsed}s`);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="merged.pdf"',
+      'X-Conversion-Time': elapsed,
+    });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR merge: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Split ────────────────────────────────────────────────────────────────────
+
+app.post('/api/split', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const t0 = Date.now();
+  try {
+    const { PDFDocument } = require('pdf-lib');
+    const bytes   = await fsPromises.readFile(req.file.path);
+    const srcDoc  = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const total   = srcDoc.getPageCount();
+    const param   = (req.query.pages || '').trim();
+    const indices = param ? parsePageRanges(param, total) : Array.from({ length: total }, (_, i) => i);
+    if (!indices.length) return res.status(400).json({ error: 'No valid pages specified' });
+
+    const outDoc = await PDFDocument.create();
+    const copied = await outDoc.copyPages(srcDoc, indices);
+    copied.forEach(p => outDoc.addPage(p));
+    const buf     = Buffer.from(await outDoc.save());
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    const base    = path.basename(req.file.originalname, '.pdf');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${base}-extracted.pdf"`,
+      'X-Conversion-Time': elapsed,
+    });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR split: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Rotate ───────────────────────────────────────────────────────────────────
+
+app.post('/api/rotate', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const deg = parseInt(req.query.degrees || '90', 10);
+  const t0  = Date.now();
+  try {
+    const { PDFDocument, degrees } = require('pdf-lib');
+    const bytes = await fsPromises.readFile(req.file.path);
+    const doc   = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    for (const page of doc.getPages()) {
+      page.setRotation(degrees((page.getRotation().angle + deg) % 360));
+    }
+    const buf     = Buffer.from(await doc.save());
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    const base    = path.basename(req.file.originalname, '.pdf');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${base}-rotated.pdf"`,
+      'X-Conversion-Time': elapsed,
+    });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR rotate: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Watermark ─────────────────────────────────────────────────────────────────
+
+app.post('/api/watermark', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const text    = (req.query.text || 'CONFIDENTIAL').slice(0, 60);
+  const opacity = Math.min(1, Math.max(0.05, parseFloat(req.query.opacity || '0.25')));
+  const t0      = Date.now();
+  try {
+    const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
+    const bytes = await fsPromises.readFile(req.file.path);
+    const doc   = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const font  = await doc.embedFont(StandardFonts.HelveticaBold);
+    for (const page of doc.getPages()) {
+      const { width, height } = page.getSize();
+      const fontSize = Math.min(width, height) * 0.09;
+      const tw       = font.widthOfTextAtSize(text, fontSize);
+      page.drawText(text, {
+        x: width / 2 - tw / 2,
+        y: height / 2 - fontSize / 2,
+        size: fontSize, font,
+        color: rgb(0.4, 0.4, 0.4),
+        opacity,
+        rotate: degrees(35),
+      });
+    }
+    const buf     = Buffer.from(await doc.save());
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    const base    = path.basename(req.file.originalname, '.pdf');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${base}-watermarked.pdf"`,
+      'X-Conversion-Time': elapsed,
+    });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR watermark: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Compress ─────────────────────────────────────────────────────────────────
+
+app.post('/api/compress', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const t0       = Date.now();
+  const origSize = req.file.size;
+  const base     = path.basename(req.file.originalname, '.pdf');
+  const outPath  = path.join(workDir, `${base}-compressed.pdf`);
+
+  try {
+    // Try Ghostscript first (best compression)
+    const gs = findGs();
+    if (gs) {
+      try {
+        await execFileAsync(gs, [
+          '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.5',
+          '-dPDFSETTINGS=/ebook',
+          '-dNOPAUSE', '-dQUIET', '-dBATCH',
+          `-sOutputFile=${outPath}`, req.file.path,
+        ], { timeout: 120000 });
+        if (fs.existsSync(outPath)) {
+          const elapsed  = ((Date.now() - t0) / 1000).toFixed(2);
+          const compSize = fs.statSync(outPath).size;
+          log(`COMPRESS gs: ${origSize} → ${compSize} bytes in ${elapsed}s`);
+          res.set({
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="${base}-compressed.pdf"`,
+            'X-Conversion-Time': elapsed,
+            'X-Original-Size': origSize,
+            'X-Compressed-Size': compSize,
+          });
+          return res.sendFile(outPath);
+        }
+      } catch {}
+    }
+
+    // Fallback: pdf-lib re-save with object streams
+    const { PDFDocument } = require('pdf-lib');
+    const bytes = await fsPromises.readFile(req.file.path);
+    const doc   = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const buf   = Buffer.from(await doc.save({ useObjectStreams: true }));
+    await fsPromises.writeFile(outPath, buf);
+    const elapsed  = ((Date.now() - t0) / 1000).toFixed(2);
+    const compSize = buf.length;
+    log(`COMPRESS pdf-lib: ${origSize} → ${compSize} bytes in ${elapsed}s`);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${base}-compressed.pdf"`,
+      'X-Conversion-Time': elapsed,
+      'X-Original-Size': origSize,
+      'X-Compressed-Size': compSize,
+    });
+    res.sendFile(outPath);
+  } catch (err) {
+    log(`ERROR compress: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Page Numbers ─────────────────────────────────────────────────────────────
+
+app.post('/api/page-numbers', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const workDir   = mkTmpDir('work');
+  const cleanup   = () => [uploadDir, workDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const position = req.query.position || 'bottom-center';
+  const startAt  = Math.max(1, parseInt(req.query.startAt || '1', 10));
+  const t0       = Date.now();
+  try {
+    const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+    const bytes = await fsPromises.readFile(req.file.path);
+    const doc   = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const font  = await doc.embedFont(StandardFonts.Helvetica);
+    const fontSize = 10;
+    const margin   = 24;
+    doc.getPages().forEach((page, i) => {
+      const { width, height } = page.getSize();
+      const label = String(i + startAt);
+      const tw    = font.widthOfTextAtSize(label, fontSize);
+      const [vert, horiz = 'center'] = position.split('-');
+      const y = vert === 'top' ? height - margin - fontSize : margin;
+      const x = horiz === 'right' ? width - margin - tw : horiz === 'left' ? margin : width / 2 - tw / 2;
+      page.drawText(label, { x, y, size: fontSize, font, color: rgb(0.3, 0.3, 0.3) });
+    });
+    const buf     = Buffer.from(await doc.save());
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    const base    = path.basename(req.file.originalname, '.pdf');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${base}-numbered.pdf"`,
+      'X-Conversion-Time': elapsed,
+    });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR page-numbers: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Edit PDF ──────────────────────────────────────────────────────────────────
+
+app.post('/api/edit-pdf', upload.single('file'), async (req, res) => {
+  const uploadDir = req._uploadDir;
+  const cleanup   = () => [uploadDir].filter(Boolean).forEach(cleanDir);
+  res.on('finish', cleanup); res.on('close', cleanup);
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+  let ops = [];
+  try { ops = JSON.parse(req.body.ops || '[]'); } catch { return res.status(400).json({ error: 'Invalid ops JSON' }); }
+
+  try {
+    const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+    const bytes  = await fsPromises.readFile(req.file.path);
+    const pdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pages  = pdfDoc.getPages();
+
+    const fontCache = {};
+    async function getFont(family, bold, italic) {
+      const key = `${family}-${!!bold}-${!!italic}`;
+      if (fontCache[key]) return fontCache[key];
+      let name;
+      if (family === 'Times') {
+        if (bold && italic) name = StandardFonts.TimesRomanBoldItalic;
+        else if (bold)       name = StandardFonts.TimesRomanBold;
+        else if (italic)     name = StandardFonts.TimesRomanItalic;
+        else                 name = StandardFonts.TimesRoman;
+      } else if (family === 'Courier') {
+        if (bold && italic) name = StandardFonts.CourierBoldOblique;
+        else if (bold)       name = StandardFonts.CourierBold;
+        else if (italic)     name = StandardFonts.CourierOblique;
+        else                 name = StandardFonts.Courier;
+      } else {
+        if (bold && italic) name = StandardFonts.HelveticaBoldOblique;
+        else if (bold)       name = StandardFonts.HelveticaBold;
+        else if (italic)     name = StandardFonts.HelveticaOblique;
+        else                 name = StandardFonts.Helvetica;
+      }
+      fontCache[key] = await pdfDoc.embedFont(name);
+      return fontCache[key];
+    }
+
+    function hexToRgb(hex) {
+      hex = (hex || '#000000').replace('#', '');
+      if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+      return rgb(parseInt(hex.slice(0,2),16)/255, parseInt(hex.slice(2,4),16)/255, parseInt(hex.slice(4,6),16)/255);
+    }
+
+    for (const op of ops) {
+      const page = pages[op.page];
+      if (!page) continue;
+      if (op.type === 'text' && op.text) {
+        const font = await getFont(op.font || 'Helvetica', op.bold, op.italic);
+        page.drawText(String(op.text), { x: op.x, y: op.y, size: op.size || 14, font, color: hexToRgb(op.color) });
+      } else if (op.type === 'rect') {
+        page.drawRectangle({ x: op.x, y: op.y, width: op.w, height: op.h, color: rgb(1,1,1) });
+      }
+    }
+
+    const buf  = Buffer.from(await pdfDoc.save());
+    const base = path.basename(req.file.originalname, '.pdf');
+    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${base}-edited.pdf"` });
+    res.send(buf);
+  } catch (err) {
+    log(`ERROR edit-pdf: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Convert (general) ────────────────────────────────────────────────────────
 
 app.post('/api/convert', upload.single('file'), async (req, res) => {
   const uploadDir = req._uploadDir;
@@ -550,14 +927,17 @@ async function zipFiles(files, outPath) {
 
 // ── Server ───────────────────────────────────────────────────────────────────
 
-const server = app.listen(PORT, () => {
-  log(`Server on http://localhost:${PORT} | LibreOffice: ${findSoffice() || 'not found'}`);
-});
-
-function gracefulShutdown() {
-  log('Shutdown: cleaning temp files');
-  for (const d of tmpDirs) cleanDir(d);
-  server.close(() => process.exit(0));
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    log(`Server on http://localhost:${PORT} | LibreOffice: ${findSoffice() || 'not found'}`);
+  });
+  function gracefulShutdown() {
+    log('Shutdown: cleaning temp files');
+    for (const d of tmpDirs) cleanDir(d);
+    server.close(() => process.exit(0));
+  }
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
 }
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
+
+module.exports = app;
