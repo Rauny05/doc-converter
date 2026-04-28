@@ -328,62 +328,250 @@ function csvToXlsx(inputPath, outPath) {
 
 // ── Pure-JS PDF helpers (serverless-safe fallbacks) ──────────────────────────
 
-function stripHtmlTags(html) {
-  return html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
+function decodeEntities(str) {
+  return (str || '')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&nbsp;/g,' ').replace(/&quot;/g,'"').replace(/&#39;/g,"'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
 }
 
-function parseHtmlBlocks(html) {
-  const blocks = [];
-  // Match block-level tags (non-greedy, handle nesting via outer tag)
-  const re = /<(h[1-6]|p|li|pre|blockquote)([^>]*)>([\s\S]*?)<\/\1>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const tag = m[1].toLowerCase();
-    const text = stripHtmlTags(m[3]).trim();
-    if (text) blocks.push({ tag, text });
-  }
-  // If nothing matched (e.g. plain text dump), use it as-is
-  if (!blocks.length) {
-    const raw = stripHtmlTags(html).trim();
-    if (raw) raw.split('\n').filter(l => l.trim()).forEach(l => blocks.push({ tag: 'p', text: l.trim() }));
-  }
-  return blocks;
+function plainText(html) {
+  return decodeEntities(html.replace(/<[^>]+>/g,' ')).replace(/\s+/g,' ').trim();
 }
 
-function renderBlocksToPdfKit(doc, blocks) {
-  for (const { tag, text } of blocks) {
-    if (tag === 'h1') {
-      doc.font('Helvetica-Bold').fontSize(22).text(text, { lineGap: 4 }).moveDown(0.6);
-    } else if (tag === 'h2') {
-      doc.font('Helvetica-Bold').fontSize(17).text(text, { lineGap: 3 }).moveDown(0.5);
-    } else if (tag === 'h3') {
-      doc.font('Helvetica-Bold').fontSize(14).text(text, { lineGap: 2 }).moveDown(0.4);
-    } else if (tag === 'h4' || tag === 'h5' || tag === 'h6') {
-      doc.font('Helvetica-Bold').fontSize(12).text(text, { lineGap: 2 }).moveDown(0.3);
-    } else if (tag === 'li') {
-      doc.font('Helvetica').fontSize(11).text(`• ${text}`, { indent: 16, lineGap: 2 });
-    } else if (tag === 'pre') {
-      doc.font('Courier').fontSize(9).text(text, { lineGap: 2 }).moveDown(0.4);
-    } else {
-      doc.font('Helvetica').fontSize(11).text(text, { lineGap: 4, align: 'justify' }).moveDown(0.3);
+// Choose pdfkit built-in font based on formatting state
+function pickFont(bold, italic, mono) {
+  if (mono) return 'Courier';
+  if (bold && italic) return 'Helvetica-BoldOblique';
+  if (bold) return 'Helvetica-Bold';
+  if (italic) return 'Helvetica-Oblique';
+  return 'Helvetica';
+}
+
+// Recursively extract inline text segments, preserving bold/italic/mono
+function inlineSegments(html, st = { bold: false, italic: false, mono: false }) {
+  const INLINE = new Set(['strong','b','em','i','u','code','a','span','mark','small','del','s','ins','cite']);
+  const out = [];
+  let s = html;
+  while (s.length) {
+    const m = s.match(/^([\s\S]*?)<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>/);
+    if (!m) { const t = decodeEntities(s); if (t) out.push({ ...st, text: t }); break; }
+    const [full, before, slash, tagRaw] = m;
+    if (before) { const t = decodeEntities(before); if (t) out.push({ ...st, text: t }); }
+    s = s.slice(full.length);
+    const tag = tagRaw.toLowerCase();
+    if (!slash && INLINE.has(tag)) {
+      const closeIdx = s.toLowerCase().indexOf(`</${tag}>`);
+      if (closeIdx >= 0) {
+        const inner = s.slice(0, closeIdx);
+        s = s.slice(closeIdx + tag.length + 3);
+        const ns = { ...st };
+        if (tag === 'strong' || tag === 'b') ns.bold = true;
+        if (tag === 'em'     || tag === 'i') ns.italic = true;
+        if (tag === 'code') ns.mono = true;
+        out.push(...inlineSegments(inner, ns));
+      }
     }
-    if (doc.y > doc.page.height - doc.page.margins.bottom - 20) doc.addPage();
+    // block/unknown tags: skip the tag itself, keep walking
+  }
+  return out.filter(seg => seg.text);
+}
+
+// Render inline segments with mixed bold/italic using pdfkit's `continued` mode
+function renderInline(doc, segs, opts = {}) {
+  const valid = segs.filter(s => s.text);
+  if (!valid.length) return false;
+  for (let i = 0; i < valid.length; i++) {
+    const s = valid[i];
+    doc.font(pickFont(s.bold, s.italic, s.mono));
+    doc.text(s.text, { continued: i < valid.length - 1, ...opts });
+  }
+  return true;
+}
+
+function needPage(doc, h = 40) {
+  return doc.y + h > doc.page.height - doc.page.margins.bottom;
+}
+
+// Render an HTML table with borders, header highlight, striped rows
+function renderHtmlTable(doc, tableHtml) {
+  // Extract rows
+  const rows = [];
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rm;
+  while ((rm = rowRe.exec(tableHtml)) !== null) {
+    const cells = [];
+    const cellRe = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    let cm;
+    while ((cm = cellRe.exec(rm[1])) !== null) {
+      cells.push(plainText(cm[1]));
+    }
+    if (cells.length) rows.push(cells);
+  }
+  if (!rows.length) return;
+
+  const colCount = Math.max(...rows.map(r => r.length));
+  const L = doc.page.margins.left;
+  const pageW = doc.page.width - L - doc.page.margins.right;
+
+  // Proportional column widths based on max content length (capped at 40 chars)
+  const maxLens = Array(colCount).fill(1);
+  rows.forEach(row => row.forEach((c, i) => {
+    maxLens[i] = Math.max(maxLens[i], Math.min(c.length, 40));
+  }));
+  const totalChars = maxLens.reduce((a, b) => a + b, 0);
+  const colW = maxLens.map(l => Math.max((l / totalChars) * pageW, pageW / (colCount * 2.5)));
+
+  const FS = 8.5, PAD = 3, ROW_H = FS + PAD * 2 + 2;
+
+  doc.moveDown(0.3);
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    if (needPage(doc, ROW_H)) doc.addPage();
+    const y = doc.y;
+    const isHeader = ri === 0;
+    let cellX = L;
+
+    // Background fill
+    for (let ci = 0; ci < colCount; ci++) {
+      const w = colW[ci];
+      const bg = isHeader ? '#E5E7EB' : ri % 2 === 0 ? '#F9FAFB' : '#FFFFFF';
+      doc.save().rect(cellX, y, w, ROW_H).fill(bg).restore();
+      cellX += w;
+    }
+
+    // Border + text
+    cellX = L;
+    for (let ci = 0; ci < colCount; ci++) {
+      const w = colW[ci];
+      doc.rect(cellX, y, w, ROW_H).stroke('#D1D5DB');
+      doc.fillColor('#111827')
+        .font(isHeader ? 'Helvetica-Bold' : 'Helvetica')
+        .fontSize(FS)
+        .text((rows[ri][ci] || '').slice(0, 80), cellX + PAD, y + PAD, { width: w - PAD * 2, lineBreak: false });
+      cellX += w;
+    }
+
+    doc.y = y + ROW_H;
+  }
+  doc.fillColor('#111827').moveDown(0.5);
+}
+
+// Core renderer: walk mammoth/HTML output and render with full formatting
+function renderHtmlContent(doc, html) {
+  if (!html || !html.trim()) return;
+
+  // Split tables out so they get special treatment
+  const parts = [];
+  let last = 0;
+  const tableRe = /<table[\s\S]*?<\/table>/gi;
+  let tm;
+  while ((tm = tableRe.exec(html)) !== null) {
+    if (tm.index > last) parts.push({ kind: 'blocks', html: html.slice(last, tm.index) });
+    parts.push({ kind: 'table', html: tm[0] });
+    last = tm.index + tm[0].length;
+  }
+  if (last < html.length) parts.push({ kind: 'blocks', html: html.slice(last) });
+
+  for (const part of parts) {
+    if (part.kind === 'table') {
+      renderHtmlTable(doc, part.html);
+    } else {
+      renderBlockElements(doc, part.html);
+    }
+  }
+}
+
+function renderBlockElements(doc, html) {
+  const blockRe = /<(h[1-6]|p|li|pre|blockquote)([^>]*?)>([\s\S]*?)<\/\1>/gi;
+  let m;
+  while ((m = blockRe.exec(html)) !== null) {
+    const tag   = m[1].toLowerCase();
+    const inner = m[3];
+    const plain = plainText(inner);
+    if (!plain) continue;
+    if (needPage(doc, 32)) doc.addPage();
+
+    if (tag === 'h1') {
+      doc.moveDown(0.4).font('Helvetica-Bold').fontSize(20).fillColor('#111827');
+      doc.text(plain, { lineGap: 4 });
+      doc.moveDown(0.4);
+
+    } else if (tag === 'h2') {
+      doc.moveDown(0.3).font('Helvetica-Bold').fontSize(16).fillColor('#1F2937');
+      doc.text(plain, { lineGap: 3 });
+      doc.moveDown(0.3);
+
+    } else if (tag === 'h3') {
+      doc.moveDown(0.2).font('Helvetica-Bold').fontSize(13).fillColor('#374151');
+      doc.text(plain, { lineGap: 2 });
+      doc.moveDown(0.2);
+
+    } else if (tag === 'h4' || tag === 'h5' || tag === 'h6') {
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('#374151');
+      doc.text(plain, { lineGap: 2 });
+      doc.moveDown(0.2);
+
+    } else if (tag === 'pre') {
+      doc.font('Courier').fontSize(9).fillColor('#374151');
+      doc.text(plain, { lineGap: 2, lineBreak: true });
+      doc.moveDown(0.4);
+
+    } else if (tag === 'blockquote') {
+      doc.font('Helvetica-Oblique').fontSize(11).fillColor('#6B7280');
+      doc.text(plain, { indent: 20, lineGap: 3 });
+      doc.moveDown(0.3);
+
+    } else if (tag === 'li') {
+      const segs = inlineSegments(inner);
+      doc.fontSize(11).fillColor('#111827');
+      // bullet + inline text on same line
+      doc.font('Helvetica').text('•  ', { continued: true, indent: 10, lineGap: 2 });
+      if (segs.length) {
+        renderInline(doc, segs, { lineGap: 2 });
+      } else {
+        doc.font('Helvetica').text(plain, { lineGap: 2 });
+      }
+
+    } else {
+      // Paragraph — render with inline bold/italic preserved
+      const segs = inlineSegments(inner);
+      const hasRichFormatting = segs.some(s => s.bold || s.italic || s.mono);
+      doc.fontSize(11).fillColor('#111827');
+      if (hasRichFormatting) {
+        renderInline(doc, segs, { lineGap: 4, align: 'left' });
+      } else {
+        doc.font('Helvetica').text(plain, { lineGap: 4, align: 'left' });
+      }
+      doc.moveDown(0.2);
+    }
   }
 }
 
 async function docxToPdfKit(inputPath, outPath) {
   const mammoth = require('mammoth');
-  const PDFDoc = require('pdfkit');
-  const htmlResult = await mammoth.convertToHtml({ path: inputPath });
-  const blocks = parseHtmlBlocks(htmlResult.value);
+  const PDFDoc  = require('pdfkit');
+  // Ask mammoth to emit rich HTML with headings, bold, italic, tables, lists
+  const result  = await mammoth.convertToHtml({ path: inputPath }, {
+    styleMap: [
+      "p[style-name='Heading 1'] => h1:fresh",
+      "p[style-name='Heading 2'] => h2:fresh",
+      "p[style-name='Heading 3'] => h3:fresh",
+      "p[style-name='Heading 4'] => h4:fresh",
+      "p[style-name='Title']     => h1:fresh",
+      "p[style-name='Subtitle']  => h2:fresh",
+    ],
+  });
   return new Promise((resolve, reject) => {
-    const doc = new PDFDoc({ margin: 72, size: 'A4' });
+    const doc = new PDFDoc({ margin: 72, size: 'A4',
+      info: { Title: path.basename(inputPath, path.extname(inputPath)) } });
     const ws = fs.createWriteStream(outPath);
     doc.pipe(ws);
-    if (!blocks.length) {
-      doc.font('Helvetica').fontSize(11).text('(Document appears to be empty)');
+    doc.font('Helvetica').fontSize(11).fillColor('#111827');
+    if (result.value.trim()) {
+      renderHtmlContent(doc, result.value);
     } else {
-      renderBlocksToPdfKit(doc, blocks);
+      doc.text('(Document appears to be empty)');
     }
     doc.end();
     ws.on('finish', resolve);
@@ -392,37 +580,24 @@ async function docxToPdfKit(inputPath, outPath) {
 }
 
 async function xlsxToPdfKit(inputPath, outPath) {
-  const XLSX = require('xlsx');
+  const XLSX   = require('xlsx');
   const PDFDoc = require('pdfkit');
-  const wb = XLSX.readFile(inputPath);
+  const wb     = XLSX.readFile(inputPath);
   return new Promise((resolve, reject) => {
     const doc = new PDFDoc({ margin: 40, size: 'A4', layout: 'landscape' });
-    const ws = fs.createWriteStream(outPath);
+    const ws  = fs.createWriteStream(outPath);
     doc.pipe(ws);
     let first = true;
     for (const sheetName of wb.SheetNames) {
       if (!first) doc.addPage();
       first = false;
-      doc.font('Helvetica-Bold').fontSize(14).text(sheetName).moveDown(0.5);
+      doc.font('Helvetica-Bold').fontSize(13).fillColor('#111827').text(sheetName);
+      doc.moveDown(0.4);
       const sheet = wb.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
-      if (!rows.length) { doc.font('Helvetica').fontSize(10).text('(empty sheet)'); continue; }
-      const colCount = Math.max(...rows.map(r => Array.isArray(r) ? r.length : 0), 1);
-      const usableW = doc.page.width - 80;
-      const colW = Math.min(Math.floor(usableW / colCount), 110);
-      for (let ri = 0; ri < Math.min(rows.length, 500); ri++) {
-        const row = rows[ri];
-        if (!Array.isArray(row)) continue;
-        const startY = doc.y;
-        const startX = doc.page.margins.left;
-        doc.font(ri === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(8.5);
-        for (let ci = 0; ci < row.length; ci++) {
-          const cellText = String(row[ci] === null || row[ci] === undefined ? '' : row[ci]);
-          doc.text(cellText.slice(0, 40), startX + ci * colW, startY, { width: colW - 3, lineBreak: false });
-        }
-        doc.y = startY + 14;
-        if (doc.y > doc.page.height - 60) doc.addPage();
-      }
+      if (!sheet['!ref']) { doc.font('Helvetica').fontSize(10).text('(empty sheet)'); continue; }
+      // Use sheet_to_html for consistent rendering through renderHtmlTable
+      const tableHtml = XLSX.utils.sheet_to_html(sheet, { editable: false });
+      renderHtmlTable(doc, tableHtml);
     }
     doc.end();
     ws.on('finish', resolve);
@@ -432,12 +607,12 @@ async function xlsxToPdfKit(inputPath, outPath) {
 
 async function htmlToPdfKit(htmlContent, outPath) {
   const PDFDoc = require('pdfkit');
-  const blocks = parseHtmlBlocks(htmlContent);
   return new Promise((resolve, reject) => {
     const doc = new PDFDoc({ margin: 72, size: 'A4' });
-    const ws = fs.createWriteStream(outPath);
+    const ws  = fs.createWriteStream(outPath);
     doc.pipe(ws);
-    renderBlocksToPdfKit(doc, blocks.length ? blocks : [{ tag: 'p', text: stripHtmlTags(htmlContent) }]);
+    doc.font('Helvetica').fontSize(11).fillColor('#111827');
+    renderHtmlContent(doc, htmlContent);
     doc.end();
     ws.on('finish', resolve);
     ws.on('error', reject);
@@ -446,12 +621,12 @@ async function htmlToPdfKit(htmlContent, outPath) {
 
 async function txtToPdfKit(inputPath, outPath) {
   const PDFDoc = require('pdfkit');
-  const text = await fsPromises.readFile(inputPath, 'utf8');
+  const text   = await fsPromises.readFile(inputPath, 'utf8');
   return new Promise((resolve, reject) => {
     const doc = new PDFDoc({ margin: 72, size: 'A4' });
-    const ws = fs.createWriteStream(outPath);
+    const ws  = fs.createWriteStream(outPath);
     doc.pipe(ws);
-    doc.font('Courier').fontSize(10).text(text, { lineGap: 3 });
+    doc.font('Courier').fontSize(10).fillColor('#111827').text(text, { lineGap: 3, lineBreak: true });
     doc.end();
     ws.on('finish', resolve);
     ws.on('error', reject);
@@ -460,15 +635,22 @@ async function txtToPdfKit(inputPath, outPath) {
 
 async function pdfToDocxFallback(inputPath, outPath) {
   const pdfParse = require('pdf-parse');
-  const { Document, Packer, Paragraph, TextRun } = require('docx');
-  const buf = await fsPromises.readFile(inputPath);
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } = require('docx');
+  const buf  = await fsPromises.readFile(inputPath);
   const data = await pdfParse(buf);
-  const paras = data.text.split(/\n{2,}/).filter(p => p.trim()).map(p =>
-    new Paragraph({ children: [new TextRun({ text: p.trim(), size: 22 })] })
-  );
-  const wordDoc = new Document({ sections: [{ children: paras.length ? paras : [new Paragraph({ children: [new TextRun('(empty)')] })] }] });
-  const buffer = await Packer.toBuffer(wordDoc);
-  await fsPromises.writeFile(outPath, buffer);
+  // Split on double newlines → paragraphs; single newlines → soft returns within para
+  const paras = data.text.split(/\n{2,}/).filter(p => p.trim()).map(p => {
+    const lines = p.trim().split('\n').filter(l => l.trim());
+    const runs = [];
+    for (let i = 0; i < lines.length; i++) {
+      runs.push(new TextRun({ text: lines[i], break: i > 0 ? 1 : 0, size: 22 }));
+    }
+    return new Paragraph({ children: runs, spacing: { after: 160 } });
+  });
+  const wordDoc = new Document({
+    sections: [{ children: paras.length ? paras : [new Paragraph({ children: [new TextRun('(empty)')] })] }],
+  });
+  await fsPromises.writeFile(outPath, await Packer.toBuffer(wordDoc));
 }
 
 // ── Merge ────────────────────────────────────────────────────────────────────
