@@ -326,6 +326,151 @@ function csvToXlsx(inputPath, outPath) {
   XLSX.writeFile(wb, outPath);
 }
 
+// ── Pure-JS PDF helpers (serverless-safe fallbacks) ──────────────────────────
+
+function stripHtmlTags(html) {
+  return html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/\s+/g,' ').trim();
+}
+
+function parseHtmlBlocks(html) {
+  const blocks = [];
+  // Match block-level tags (non-greedy, handle nesting via outer tag)
+  const re = /<(h[1-6]|p|li|pre|blockquote)([^>]*)>([\s\S]*?)<\/\1>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const text = stripHtmlTags(m[3]).trim();
+    if (text) blocks.push({ tag, text });
+  }
+  // If nothing matched (e.g. plain text dump), use it as-is
+  if (!blocks.length) {
+    const raw = stripHtmlTags(html).trim();
+    if (raw) raw.split('\n').filter(l => l.trim()).forEach(l => blocks.push({ tag: 'p', text: l.trim() }));
+  }
+  return blocks;
+}
+
+function renderBlocksToPdfKit(doc, blocks) {
+  for (const { tag, text } of blocks) {
+    if (tag === 'h1') {
+      doc.font('Helvetica-Bold').fontSize(22).text(text, { lineGap: 4 }).moveDown(0.6);
+    } else if (tag === 'h2') {
+      doc.font('Helvetica-Bold').fontSize(17).text(text, { lineGap: 3 }).moveDown(0.5);
+    } else if (tag === 'h3') {
+      doc.font('Helvetica-Bold').fontSize(14).text(text, { lineGap: 2 }).moveDown(0.4);
+    } else if (tag === 'h4' || tag === 'h5' || tag === 'h6') {
+      doc.font('Helvetica-Bold').fontSize(12).text(text, { lineGap: 2 }).moveDown(0.3);
+    } else if (tag === 'li') {
+      doc.font('Helvetica').fontSize(11).text(`• ${text}`, { indent: 16, lineGap: 2 });
+    } else if (tag === 'pre') {
+      doc.font('Courier').fontSize(9).text(text, { lineGap: 2 }).moveDown(0.4);
+    } else {
+      doc.font('Helvetica').fontSize(11).text(text, { lineGap: 4, align: 'justify' }).moveDown(0.3);
+    }
+    if (doc.y > doc.page.height - doc.page.margins.bottom - 20) doc.addPage();
+  }
+}
+
+async function docxToPdfKit(inputPath, outPath) {
+  const mammoth = require('mammoth');
+  const PDFDoc = require('pdfkit');
+  const htmlResult = await mammoth.convertToHtml({ path: inputPath });
+  const blocks = parseHtmlBlocks(htmlResult.value);
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDoc({ margin: 72, size: 'A4' });
+    const ws = fs.createWriteStream(outPath);
+    doc.pipe(ws);
+    if (!blocks.length) {
+      doc.font('Helvetica').fontSize(11).text('(Document appears to be empty)');
+    } else {
+      renderBlocksToPdfKit(doc, blocks);
+    }
+    doc.end();
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+  });
+}
+
+async function xlsxToPdfKit(inputPath, outPath) {
+  const XLSX = require('xlsx');
+  const PDFDoc = require('pdfkit');
+  const wb = XLSX.readFile(inputPath);
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDoc({ margin: 40, size: 'A4', layout: 'landscape' });
+    const ws = fs.createWriteStream(outPath);
+    doc.pipe(ws);
+    let first = true;
+    for (const sheetName of wb.SheetNames) {
+      if (!first) doc.addPage();
+      first = false;
+      doc.font('Helvetica-Bold').fontSize(14).text(sheetName).moveDown(0.5);
+      const sheet = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      if (!rows.length) { doc.font('Helvetica').fontSize(10).text('(empty sheet)'); continue; }
+      const colCount = Math.max(...rows.map(r => Array.isArray(r) ? r.length : 0), 1);
+      const usableW = doc.page.width - 80;
+      const colW = Math.min(Math.floor(usableW / colCount), 110);
+      for (let ri = 0; ri < Math.min(rows.length, 500); ri++) {
+        const row = rows[ri];
+        if (!Array.isArray(row)) continue;
+        const startY = doc.y;
+        const startX = doc.page.margins.left;
+        doc.font(ri === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(8.5);
+        for (let ci = 0; ci < row.length; ci++) {
+          const cellText = String(row[ci] === null || row[ci] === undefined ? '' : row[ci]);
+          doc.text(cellText.slice(0, 40), startX + ci * colW, startY, { width: colW - 3, lineBreak: false });
+        }
+        doc.y = startY + 14;
+        if (doc.y > doc.page.height - 60) doc.addPage();
+      }
+    }
+    doc.end();
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+  });
+}
+
+async function htmlToPdfKit(htmlContent, outPath) {
+  const PDFDoc = require('pdfkit');
+  const blocks = parseHtmlBlocks(htmlContent);
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDoc({ margin: 72, size: 'A4' });
+    const ws = fs.createWriteStream(outPath);
+    doc.pipe(ws);
+    renderBlocksToPdfKit(doc, blocks.length ? blocks : [{ tag: 'p', text: stripHtmlTags(htmlContent) }]);
+    doc.end();
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+  });
+}
+
+async function txtToPdfKit(inputPath, outPath) {
+  const PDFDoc = require('pdfkit');
+  const text = await fsPromises.readFile(inputPath, 'utf8');
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDoc({ margin: 72, size: 'A4' });
+    const ws = fs.createWriteStream(outPath);
+    doc.pipe(ws);
+    doc.font('Courier').fontSize(10).text(text, { lineGap: 3 });
+    doc.end();
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+  });
+}
+
+async function pdfToDocxFallback(inputPath, outPath) {
+  const pdfParse = require('pdf-parse');
+  const { Document, Packer, Paragraph, TextRun } = require('docx');
+  const buf = await fsPromises.readFile(inputPath);
+  const data = await pdfParse(buf);
+  const paras = data.text.split(/\n{2,}/).filter(p => p.trim()).map(p =>
+    new Paragraph({ children: [new TextRun({ text: p.trim(), size: 22 })] })
+  );
+  const wordDoc = new Document({ sections: [{ children: paras.length ? paras : [new Paragraph({ children: [new TextRun('(empty)')] })] }] });
+  const buffer = await Packer.toBuffer(wordDoc);
+  await fsPromises.writeFile(outPath, buffer);
+}
+
 // ── Merge ────────────────────────────────────────────────────────────────────
 
 app.post('/api/merge', uploadMulti.array('files', 20), async (req, res) => {
@@ -692,12 +837,33 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     // ── Office/document → PDF ──────────────────────────────────────────────
     if (['docx','doc','odt','rtf','pptx','ppt','odp'].includes(inputFmt) && targetFormat === 'pdf') {
-      outputPath = await libreOffice(inputPath, 'pdf', workDir);
+      outputPath = path.join(workDir, `${base}.pdf`);
+      if (findSoffice()) {
+        outputPath = await libreOffice(inputPath, 'pdf', workDir);
+      } else if (['docx','doc'].includes(inputFmt)) {
+        await docxToPdfKit(inputPath, outputPath);
+      } else {
+        throw Object.assign(new Error(`${inputFmt.toUpperCase()} to PDF requires LibreOffice which is not available in cloud mode. DOCX and DOC files are supported.`), { code: 'NO_LIBREOFFICE' });
+      }
       contentType = 'application/pdf';
       outputFilename = `${base}.pdf`;
 
-    } else if (['xlsx','xls','ods'].includes(inputFmt) && targetFormat === 'pdf') {
-      outputPath = await libreOffice(inputPath, 'pdf', workDir);
+    } else if (['xlsx','xls','ods','csv'].includes(inputFmt) && targetFormat === 'pdf') {
+      outputPath = path.join(workDir, `${base}.pdf`);
+      if (findSoffice()) {
+        outputPath = await libreOffice(inputPath, 'pdf', workDir);
+      } else if (['xlsx','xls'].includes(inputFmt)) {
+        await xlsxToPdfKit(inputPath, outputPath);
+      } else if (inputFmt === 'csv') {
+        // reuse xlsx reader for csv
+        const XLSX = require('xlsx');
+        const wb2 = XLSX.readFile(inputPath);
+        const tmpXlsx = path.join(workDir, `${base}.xlsx`);
+        XLSX.writeFile(wb2, tmpXlsx);
+        await xlsxToPdfKit(tmpXlsx, outputPath);
+      } else {
+        throw Object.assign(new Error(`${inputFmt.toUpperCase()} to PDF requires LibreOffice which is not available in cloud mode.`), { code: 'NO_LIBREOFFICE' });
+      }
       contentType = 'application/pdf';
       outputFilename = `${base}.pdf`;
 
@@ -749,34 +915,40 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
       outputFilename = `${base}.xlsx`;
 
-    } else if (inputFmt === 'csv' && targetFormat === 'pdf') {
-      const XLSX = require('xlsx');
-      const content = fs.readFileSync(inputPath, 'utf8');
-      const rows = content.split('\n').map(r => `<tr>${r.split(',').map(c => `<td>${c}</td>`).join('')}</tr>`).join('');
-      const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
-        <style>table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px;font-size:12px;}
-        body{font-family:sans-serif;padding:20px;}</style></head>
-        <body><table>${rows}</table></body></html>`;
-      const hp = path.join(workDir, 'input.html');
-      await fsPromises.writeFile(hp, html, 'utf8');
-      const pdfBuf = await htmlToPdf(hp);
-      outputPath = path.join(workDir, `${base}.pdf`);
-      await fsPromises.writeFile(outputPath, pdfBuf);
-      contentType = 'application/pdf';
-      outputFilename = `${base}.pdf`;
-
     // ── HTML / Markdown / TXT → PDF ────────────────────────────────────────
     } else if (inputFmt === 'html' && targetFormat === 'pdf') {
-      const pdfBuf = await htmlToPdf(inputPath);
       outputPath = path.join(workDir, `${base}.pdf`);
-      await fsPromises.writeFile(outputPath, pdfBuf);
+      if (findSoffice()) {
+        const pdfBuf = await htmlToPdf(inputPath);
+        await fsPromises.writeFile(outputPath, pdfBuf);
+      } else {
+        const htmlContent = await fsPromises.readFile(inputPath, 'utf8');
+        await htmlToPdfKit(htmlContent, outputPath);
+      }
       contentType = 'application/pdf';
       outputFilename = `${base}.pdf`;
 
     } else if (inputFmt === 'md' && targetFormat === 'pdf') {
-      const pdfBuf = await markdownToPdf(inputPath, workDir);
       outputPath = path.join(workDir, `${base}.pdf`);
-      await fsPromises.writeFile(outputPath, pdfBuf);
+      const md = await fsPromises.readFile(inputPath, 'utf8');
+      // Simple markdown → HTML: headings, bold, lists
+      const mdHtml = md
+        .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+        .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+        .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+        .replace(/^\* (.+)$/gm, '<li>$1</li>')
+        .replace(/^\- (.+)$/gm, '<li>$1</li>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .split('\n\n').map(p => p.startsWith('<') ? p : `<p>${p}</p>`).join('');
+      if (findSoffice()) {
+        const htmlPath = path.join(workDir, 'input.html');
+        await fsPromises.writeFile(htmlPath, `<!DOCTYPE html><html><body>${mdHtml}</body></html>`);
+        const pdfBuf = await htmlToPdf(htmlPath);
+        await fsPromises.writeFile(outputPath, pdfBuf);
+      } else {
+        await htmlToPdfKit(mdHtml, outputPath);
+      }
       contentType = 'application/pdf';
       outputFilename = `${base}.pdf`;
 
@@ -790,9 +962,13 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       outputFilename = `${base}.html`;
 
     } else if (inputFmt === 'txt' && targetFormat === 'pdf') {
-      const pdfBuf = await txtToPdf(inputPath, workDir);
       outputPath = path.join(workDir, `${base}.pdf`);
-      await fsPromises.writeFile(outputPath, pdfBuf);
+      if (findSoffice()) {
+        const pdfBuf = await txtToPdf(inputPath, workDir);
+        await fsPromises.writeFile(outputPath, pdfBuf);
+      } else {
+        await txtToPdfKit(inputPath, outputPath);
+      }
       contentType = 'application/pdf';
       outputFilename = `${base}.pdf`;
 
@@ -832,12 +1008,18 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     // ── PDF → DOCX ─────────────────────────────────────────────────────────
     } else if (inputFmt === 'pdf' && targetFormat === 'docx') {
-      outputPath = await libreOffice(inputPath, 'docx', workDir, 'writer_pdf_import');
+      outputPath = path.join(workDir, `${base}.docx`);
+      if (findSoffice()) {
+        outputPath = await libreOffice(inputPath, 'docx', workDir, 'writer_pdf_import');
+      } else {
+        await pdfToDocxFallback(inputPath, outputPath);
+      }
       contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
       outputFilename = `${base}.docx`;
 
     // ── PDF → XLSX ─────────────────────────────────────────────────────────
     } else if (inputFmt === 'pdf' && targetFormat === 'xlsx') {
+      if (!findSoffice()) throw Object.assign(new Error('PDF to Excel conversion requires LibreOffice and is not available in cloud mode.'), { code: 'NO_LIBREOFFICE' });
       outputPath = await libreOffice(inputPath, 'xlsx', workDir, 'calc_pdf_import');
       contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
       outputFilename = `${base}.xlsx`;
@@ -852,6 +1034,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     // ── PDF → PNG ──────────────────────────────────────────────────────────
     } else if (inputFmt === 'pdf' && targetFormat === 'png') {
+      if (!findSoffice()) throw Object.assign(new Error('PDF to Images conversion requires LibreOffice and is not available in cloud mode.'), { code: 'NO_LIBREOFFICE' });
       outputPath = await libreOffice(inputPath, 'png', workDir);
       const outFiles = fs.readdirSync(workDir).filter(f => f.endsWith('.png'));
       if (!outFiles.length) throw new Error('LibreOffice did not produce PNG output');
